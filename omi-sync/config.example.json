@@ -1,0 +1,9 @@
+{
+  "api_key": "",
+  "vault_path": "C:\\Users\\YOU\\Documents\\SecondBrain",
+  "subfolder": "Omi",
+  "index_file": "_Omi Index.md",
+  "lookback_days": 7,
+  "include_transcript": true,
+  "max_pages": 40
+}

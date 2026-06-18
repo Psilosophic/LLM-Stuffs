@@ -27,28 +27,30 @@ replies are grounded in your wiki.
 If a required variable is missing, the bot prints a friendly one-line fix and
 exits cleanly — it does not crash.
 
-## Always-on (Task Scheduler, hidden, runs at logon)
+## Always-on (hidden, starts at logon)
 
-So your brain is reachable 24/7 without a terminal window sitting open:
+`pythonw.exe` runs the bot with **no console window**, so a single scheduled task
+launched at logon keeps your brain reachable 24/7. One line in PowerShell:
 
-1. Save a tiny launcher next to the bot as `run-bot.vbs` (runs Python with no
-   visible window):
-   ```vbscript
-   CreateObject("WScript.Shell").Run "python """ & _
-     CreateObject("Scripting.FileSystemObject").GetParentFolderName(WScript.ScriptFullName) & _
-     "\telegram_brain_bot.py""", 0, False
-   ```
-2. **Task Scheduler** → *Create Task* (not Basic):
-   - **General:** *Run only when user is logged on*; tick *Hidden*.
-   - **Triggers:** New → *At log on* (your user).
-   - **Actions:** New → *Start a program* → `wscript.exe`, argument the full path
-     to `run-bot.vbs`.
-   - **Settings:** untick *Stop the task if it runs longer than…* (it's meant to
-     run forever); tick *If the task fails, restart every 1 minute*.
-3. Log off/on (or *Run* the task once) to start it.
+```powershell
+schtasks /Create /TN "Telegram Brain Bot" /TR "`"$((Get-Command pythonw).Source)`" `"$env:USERPROFILE\.claude\skills\ai-second-brain-windows\telegram\telegram_brain_bot.py`"" /SC ONLOGON /F
+```
 
-To stop: end the task in Task Scheduler, or kill the `python.exe`/`wscript.exe`
-process.
+(Adjust the script path if you didn't install the skill to the default location.)
+
+Start it now without logging out:
+```powershell
+schtasks /Run /TN "Telegram Brain Bot"
+```
+
+For auto-restart if it ever crashes, open the task in Task Scheduler →
+**Settings** → tick *If the task fails, restart every 1 minute*.
+
+To stop it for good:
+```powershell
+schtasks /Delete /TN "Telegram Brain Bot" /F
+```
+(then end any lingering `pythonw.exe` in Task Manager).
 
 ## Security notes
 - The bot ignores every Telegram user except `TELEGRAM_ALLOWED_USER_ID`.

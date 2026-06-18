@@ -1,0 +1,5 @@
+# Never commit secrets or local sync state
+config.json
+.omi_sync_state.json
+__pycache__/
+*.pyc

@@ -92,6 +92,22 @@ You can also skip files entirely and add **Omi's MCP server**
 client to query conversations live. The file sync and the MCP are complementary:
 files give durable, greppable memory; MCP gives live lookup.
 
+## Feeding the Second Brain (the closed loop)
+
+This pairs with the `ai-second-brain-windows` skill in this repo. Point the sync
+at the Brain vault's `raw\` folder and Omi conversations become *input sources*
+that Claude Code compiles into the wiki — so constant recording flows straight
+into your living memory:
+
+```
+Omi conversation  ->  Brain\raw\Omi\*.md  ->  (Claude Code per CLAUDE.md)  ->  Brain\wiki\
+```
+
+Set `vault_path` to the Brain folder and `subfolder` to `raw\Omi` (the exact
+commands are in the project README / chat). Then a normal Brain session —
+*"Compile the new sources in raw\ per CLAUDE.md"* — pulls each conversation into
+tagged, wikilinked notes. Run it on a schedule and the loop is fully automatic.
+
 ## Privacy
 
 Constant recording captures everyone around you, and these notes are

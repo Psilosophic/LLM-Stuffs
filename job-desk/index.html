@@ -202,6 +202,7 @@ nav.tabs button:focus-visible{outline:3px solid var(--accent);outline-offset:-4p
       </div>
       <button class="btn primary block" type="submit" id="searchBtn">Search</button>
     </form></details>
+    <div id="batchBox"></div>
     <div id="results"></div>
   </section>
 
@@ -315,7 +316,7 @@ function useCap(name) {
 }
 
 /* ---------- storage: private per-user cloud rows, or this device ---------- */
-const TRANSIENT = ["fetching", "fetchNote", "evalErr", "draftErr", "draftStage", "reviseErr", "formErr", "prepErr", "prepLive", "mockErr", "mockLive"];
+const TRANSIENT = ["kitStage", "kitErr", "fetching", "fetchNote", "evalErr", "draftErr", "draftStage", "reviseErr", "formErr", "prepErr", "prepLive", "mockErr", "mockLive"];
 const strip = a => { const o = { ...a }; TRANSIENT.forEach(k => delete o[k]); return o; };
 const store = {
   col: null,
@@ -641,6 +642,12 @@ function renderResults() {
     ${newCount && newCount < S.results.length ? `<div class="seg" role="group" aria-label="Show"><button aria-pressed="${!S.newOnly}" data-act="newOnly" data-v="0">All</button><button aria-pressed="${S.newOnly}" data-act="newOnly" data-v="1">New only</button></div>` : ""}
     <p class="muted small">These listings were found using AI-powered search. Review details and confirm them with the employer before applying.</p>
   </div>
+  ${S.results.some(j => j.fit != null) && !(S.batch && S.batch.running) ? (() => { const bp = lsGet("batchPrefs") || { min: 70, max: 3 }; const n = batchCandidates(bp.min).length; return `<div class="card"><span class="eyebrow">Prep applications for me</span>
+    <p class="small">Claude runs the full application for each top match: fit check, tailored CV and cover letter with a reviewer pass, and answers to the form questions. You review and hit send.</p>
+    <div class="row"><label class="f grow" for="batchMin">Only jobs scoring at least<select id="batchMin">${[60, 65, 70, 75, 80, 85].map(v => `<option ${v === bp.min ? "selected" : ""}>${v}</option>`).join("")}</select></label>
+      <label class="f grow" for="batchMax">How many<select id="batchMax">${[1, 2, 3, 5, 8].map(v => `<option ${v === bp.max ? "selected" : ""}>${v}</option>`).join("")}</select></label></div>
+    <button class="btn primary block" data-act="batch">Prep ${Math.min(n, bp.max)} application${Math.min(n, bp.max) === 1 ? "" : "s"}</button>
+    <p class="small muted">${n} ranked job${n === 1 ? "" : "s"} qualify. It skips jobs with a risk flag, ZipRecruiter listings (no full description), and ones you've already prepped.</p></div>`; })() : ""}
   <div class="stack">${shown.map(([j, i]) => `<article class="job">
     <div class="row" style="align-items:flex-start"><div class="grow"><div class="t">${esc(j.title)}</div>
       <div class="meta">${esc(j.company)}${j.location ? " · " + esc(j.location) : ""}</div></div>
@@ -650,6 +657,7 @@ function renderResults() {
     <div class="row">${j.isNew && newCount < S.results.length ? `<span class="pill info">New</span>` : ""}${j.flag ? `<span class="pill bad">${esc(j.flag)} risk</span>` : ""}${tracked.has(jobKey(j)) ? `<span class="pill info">Tracked</span>` : ""}<span class="src grow">${esc(j.src)}</span></div>
     <div class="row">
       <button class="btn sm primary" data-act="pick" data-i="${i}">Check fit</button>
+      ${j.src !== "ZipRecruiter" ? `<button class="btn sm" data-act="pickKit" data-i="${i}">Prep it all</button>` : ""}
       ${j.url ? `<a class="btn sm" href="${esc(j.url)}" target="_blank" rel="noopener">Open posting ↗</a>` : ""}
       ${tracked.has(jobKey(j)) ? "" : `<button class="btn sm ghost" data-act="save" data-i="${i}">Save</button>`}
     </div></article>`).join("")}</div>`;
@@ -676,18 +684,19 @@ async function fetchDetails(a, j) {
     return { text: head + (j.summary || ""), partial: true };
   } catch (e) { return { text: head + (j.summary || ""), partial: true, err: mcpErr(e, j.src) }; }
 }
-async function pickJob(i, saveOnly) {
+async function pickJob(i, saveOnly, kit) {
   const j = S.results[i]; if (!j) return;
   const existing = S.apps.find(a => jobKey(a) === jobKey(j));
   if (saveOnly) { if (!existing) { await store.saveApp(jobToApp(j)); toast("Saved to tracker"); renderResults(); } return; }
-  if (existing) { openApp(existing.id); return; }
+  if (existing) { openApp(existing.id); if (kit && !existing.ready) kitForCurrent(); return; }
   S.currentId = null; S.current = jobToApp(j); S.current.fetching = true; S.current.fetchNote = "";
   go("apply");
   const d = await fetchDetails(S.current, j);
   if (S.current && S.current.fetching && jobKey(S.current) === jobKey(j)) {
     S.current.posting = d.text; S.current.fetching = false;
     S.current.fetchNote = d.err ? d.err + " Paste the full description from the posting below." : d.partial ? `${j.src} only shares a short summary. Open the posting, copy the full description, and paste it below for a proper fit check.` : "";
-    renderApply();
+    renderApply.force = true; renderApply();
+    if (kit && !d.partial && !d.err) kitForCurrent();
   }
 }
 function openApp(id) { const a = S.apps.find(x => x.id === id); if (!a) return; S.currentId = id; S.current = a; S.docView = "cv"; go("apply"); }
@@ -699,14 +708,8 @@ function verdict(n) { return n >= 75 ? ["Strong fit", "good", "Definitely apply.
 function overall(ev) { let s = 0; for (const k in WEIGHTS) s += WEIGHTS[k] * (Number(ev.scores?.[k]?.score) || 0); return Math.round(s); }
 function hardStop(ev) { return ["eligibility", "language", "location"].map(k => ev[k]).find(g => g && g.verdict === "FAIL"); }
 
-async function evaluate() {
-  const a = S.current; if (!a) return;
-  syncApplyInputs();
-  if (!profileReady()) { toast("Set up your profile first"); go("profile"); return; }
-  if ((a.posting || "").trim().length < 200) { toast("Paste the full job description first"); $("#posting")?.focus(); return; }
-  S.busy.eval = true; a.evalErr = ""; renderApply();
-  try {
-    const ev = await ask("json", `You are a career advisor running a structured job-fit evaluation. Be honest and specific; a flattering score wastes the candidate's time.
+async function evalCore(a) {
+  const ev = await ask("json", `You are a career advisor running a structured job-fit evaluation. Be honest and specific; a flattering score wastes the candidate's time.
 
 ${profileBlock()}
 
@@ -732,16 +735,25 @@ Reply with only JSON:
 "keywords":["8-15 posting keywords the application should mirror, only ones the candidate can honestly claim"],
 "recommendation":"1-2 sentences: apply / skip / apply with caveats, and why",
 "call_employer":{"suggest":false,"questions":[]}}`, { modelTier: "default" });
-    if (!ev || !ev.scores) throw { code: "invalid_json" };
-    a.eval = { eligibility: ev.eligibility, language: ev.language_gate, location: ev.location_gate, scores: ev.scores,
-      strengths: ev.strengths || [], gaps: ev.gaps || [], keywords: ev.keywords || [], recommendation: ev.recommendation || "",
-      call_employer: ev.call_employer || null, postingLanguage: ev.language || "English" };
-    a.score = overall(a.eval); a.verdict = verdict(a.score)[0];
-    if (ev.company && !a.company) a.company = ev.company;
-    if (ev.role && !a.role) a.role = ev.role;
-    if (ev.location && !a.location) a.location = ev.location;
-    if (ev.deadline && /^\d{4}-\d{2}-\d{2}$/.test(ev.deadline)) a.deadline = ev.deadline;
-    if (!a.created) a.created = today();
+  if (!ev || !ev.scores) throw { code: "invalid_json" };
+  a.eval = { eligibility: ev.eligibility, language: ev.language_gate, location: ev.location_gate, scores: ev.scores,
+    strengths: ev.strengths || [], gaps: ev.gaps || [], keywords: ev.keywords || [], recommendation: ev.recommendation || "",
+    call_employer: ev.call_employer || null, postingLanguage: ev.language || "English" };
+  a.score = overall(a.eval); a.verdict = verdict(a.score)[0];
+  if (ev.company && !a.company) a.company = ev.company;
+  if (ev.role && !a.role) a.role = ev.role;
+  if (ev.location && !a.location) a.location = ev.location;
+  if (ev.deadline && /^\d{4}-\d{2}-\d{2}$/.test(ev.deadline)) a.deadline = ev.deadline;
+  if (!a.created) a.created = today();
+}
+async function evaluate() {
+  const a = S.current; if (!a) return;
+  syncApplyInputs();
+  if (!profileReady()) { toast("Set up your profile first"); go("profile"); return; }
+  if ((a.posting || "").trim().length < 200) { toast("Paste the full job description first"); $("#posting")?.focus(); return; }
+  S.busy.eval = true; a.evalErr = ""; renderApply();
+  try {
+    await evalCore(a);
     const saved = await store.saveApp(a); S.currentId = saved.id; S.current = saved;
   } catch (e) { a.evalErr = sampleErr(e); }
   S.busy.eval = false; renderApply();
@@ -765,13 +777,9 @@ const WRITING_RULES = `NON-NEGOTIABLE RULES
 CV: ATS-friendly, plain section headings, reverse chronological, max 2 pages (about 450-700 words). Headline formula: [their title or education] + [a relevant keyword from the posting]. Summary targets this role. Skills grouped, mirroring posting keywords the candidate genuinely has. 3-5 outcome-focused bullets for relevant recent roles, fewer for old or unrelated ones; start with action verbs, use numbers only where the profile gives them. Dates as plain ASCII ranges like "Jan 2021 - Mar 2024" or "2019 - 2021".
 COVER LETTER: one page, 250-300 words of body text. Salutation to a named person if the posting names one, else "Dear [Company] hiring team,". Opening names the role and connects their background in 2-3 sentences. The "why this company" section comes early and uses the posting's own themes. Forward-looking: what tasks they will solve and how, with 1-2 brief past proofs. 3-5 specific bullets. Short confident close.`;
 
-async function draftDocs(override) {
-  const a = S.current; if (!a || !a.eval) return;
-  if (!override && hardStop(a.eval)) { toast("This job fails a hard requirement"); return; }
-  S.busy.draft = true; a.draftErr = ""; a.draftStage = "Drafting your CV and cover letter (step 1 of 2)…"; renderApply();
+async function draftCore(a, stage) {
   const evalSummary = JSON.stringify({ score: a.score, strengths: a.eval.strengths, gaps: a.eval.gaps, keywords: a.eval.keywords });
-  try {
-    const draft = await ask("json", `You are the DRAFTER in a drafter-reviewer job application workflow. Write a tailored CV and cover letter for this posting.
+  const draft = await ask("json", `You are the DRAFTER in a drafter-reviewer job application workflow. Write a tailored CV and cover letter for this posting.
 
 ${profileBlock()}
 
@@ -783,9 +791,9 @@ ${WRITING_RULES}
 
 Today's date: ${today()}.
 Reply with only JSON in exactly this shape:
-${DOC_SHAPE}`, { modelTier: "complex", cache: false, onText: ({ text }) => { a.draftStage = `Drafting your CV and cover letter (step 1 of 2)… ${Math.round(text.length / 100) / 10}k characters`; updateStage(a.draftStage); } });
-    a.draftStage = "A hiring-manager reviewer is critiquing the draft (step 2 of 2)…"; updateStage(a.draftStage);
-    const rev = await ask("json", `You are a hiring manager proxy reviewing an application for ${a.role} at ${a.company}. Make it as targeted and compelling as possible WITHOUT inventing anything.
+${DOC_SHAPE}`, { modelTier: "complex", cache: false, onText: ({ text }) => { stage(`Drafting your CV and cover letter (step 1 of 2)… ${Math.round(text.length / 100) / 10}k characters`); } });
+  stage("A hiring-manager reviewer is critiquing the draft (step 2 of 2)…");
+  const rev = await ask("json", `You are a hiring manager proxy reviewing an application for ${a.role} at ${a.company}. Make it as targeted and compelling as possible WITHOUT inventing anything.
 
 ${profileBlock()}
 
@@ -799,22 +807,113 @@ Then return the improved final versions.
 
 ${WRITING_RULES}
 
-Reply with only JSON: {"review":[{"area":"CV|Cover letter","issue":"","fix":""}], ...the improved documents in this shape: ${DOC_SHAPE}}`, { modelTier: "default", cache: false, onText: ({ text }) => updateStage(`A hiring-manager reviewer is critiquing the draft (step 2 of 2)… ${Math.round(text.length / 100) / 10}k characters`) });
-    const final = rev && rev.cv && rev.cover ? rev : draft;
-    if (!final || !final.cv || !final.cover) throw { code: "invalid_json" };
-    a.docs = deepNoDash({ cv: final.cv, cover: final.cover });
-    a.flags = (final.stretch_flags || draft.stretch_flags || []).filter(f => f && f.text);
-    a.review = (rev && rev.review) || [];
-    if (a.status === "saved") a.status = "drafted";
+Reply with only JSON: {"review":[{"area":"CV|Cover letter","issue":"","fix":""}], ...the improved documents in this shape: ${DOC_SHAPE}}`, { modelTier: "default", cache: false, onText: ({ text }) => stage(`A hiring-manager reviewer is critiquing the draft (step 2 of 2)… ${Math.round(text.length / 100) / 10}k characters`) });
+  const final = rev && rev.cv && rev.cover ? rev : draft;
+  if (!final || !final.cv || !final.cover) throw { code: "invalid_json" };
+  a.docs = deepNoDash({ cv: final.cv, cover: final.cover });
+  a.flags = (final.stretch_flags || draft.stretch_flags || []).filter(f => f && f.text);
+  a.review = (rev && rev.review) || [];
+  if (a.status === "saved") a.status = "drafted";
+}
+async function draftDocs(override) {
+  const a = S.current; if (!a || !a.eval) return;
+  if (!override && hardStop(a.eval)) { toast("This job fails a hard requirement"); return; }
+  S.busy.draft = true; a.draftErr = ""; a.draftStage = "Drafting your CV and cover letter (step 1 of 2)…"; renderApply();
+  try {
+    await draftCore(a, t => { a.draftStage = t; updateStage(t); });
     await store.saveApp(a);
   } catch (e) { a.draftErr = sampleErr(e); }
   S.busy.draft = false; a.draftStage = ""; renderApply();
 }
 function updateStage(t) { const el = $("#stage"); if (el) el.textContent = t; }
 
-async function reviseDocs(instruction, which) {
+/* pre-answer the posting's own application questions plus the usual form questions */
+async function answersCore(a) {
+  const out = await ask("json", `Pre-write answers for the application form for ${a.role} at ${a.company}.
+Answer, in first person, plain text, no markdown, no em dashes, only facts from the profile:
+1. EVERY question the posting itself lists under "Application Question(s)" or similar (quote the question exactly). For yes/no or years-of-experience questions, answer honestly from the profile and add one short line of proof.
+2. Then these standard ones: "Why are you interested in this role?" (80-120 words, uses the posting's own themes), "Tell us about yourself" (60-90 words), "Desired salary" (from the profile; if none, give a range that fits the posting's pay), "Are you legally authorized to work in the US? Will you need sponsorship?" (from the profile; if unknown, write "[check]").
+
+${profileBlock()}
+
+${postingBlock(a)}
+
+Reply with only JSON: [{"q":"question","a":"answer"}]`, { modelTier: "default", cache: false });
+  a.answers = (Array.isArray(out) ? out : []).filter(x => x && x.q && x.a).map(x => ({ q: String(x.q), a: noDash(String(x.a)) }));
+}
+
+/* the whole /apply pipeline, unattended: fit check -> (stop on hard fail / low score) -> draft + review -> form answers */
+async function runKit(a, stage, opts = {}) {
+  const min = opts.minScore ?? 0;
+  if (!a.eval) { stage("Checking fit…"); await evalCore(a); await store.saveApp(a); }
+  const stop = hardStop(a.eval);
+  if (stop && !opts.override) { a.kitNote = "Stopped: fails a hard requirement. " + (stop.note || ""); return "stopped"; }
+  if (a.score < min) { a.kitNote = `Skipped: fit score ${a.score} is below your cutoff of ${min}.`; if (a.status === "saved") a.status = "skipped"; await store.saveApp(a); return "skipped"; }
+  if (!a.docs) { await draftCore(a, stage); await store.saveApp(a); }
+  if (!a.answers) { stage("Pre-writing the application form answers…"); await answersCore(a); }
+  a.kitNote = ""; a.ready = true; if (a.status === "saved") a.status = "drafted";
+  await store.saveApp(a);
+  return "ready";
+}
+async function kitForCurrent() {
+  const a = S.current; if (!a) return;
+  syncApplyInputs();
+  if (!profileReady()) { toast("Set up your profile first"); go("profile"); return; }
+  if ((a.posting || "").trim().length < 200) { toast("Paste the full job description first"); $("#posting")?.focus(); return; }
+  S.busy.kit = true; a.kitErr = ""; a.kitStage = "Starting…"; renderApply();
+  try {
+    await runKit(a, t => { a.kitStage = t; const el = $("#kitStage"); if (el) el.textContent = t; else renderApply(); });
+    S.currentId = a.id; S.current = a;
+  } catch (e) { a.kitErr = sampleErr(e); }
+  S.busy.kit = false; a.kitStage = ""; renderApply.force = true; renderApply();
+}
+
+/* batch: build kits for several jobs in a row while the page stays open */
+let wakeLock = null;
+async function keepAwake(on) {
+  try { if (on && !wakeLock && navigator.wakeLock) { wakeLock = await navigator.wakeLock.request("screen"); } else if (!on && wakeLock) { await wakeLock.release(); wakeLock = null; } } catch { wakeLock = null; }
+}
+function batchCandidates(minScore) {
+  const tracked = new Set(S.apps.filter(a => a.ready || a.status !== "saved").map(jobKey));
+  return S.results.filter(j => j.fit != null && j.fit >= minScore && j.flag === "" && j.src !== "ZipRecruiter" && !tracked.has(jobKey(j)));
+}
+async function runBatch() {
+  const min = Number(($("#batchMin") || {}).value) || 70, max = Number(($("#batchMax") || {}).value) || 3;
+  const list = batchCandidates(min).slice(0, max);
+  if (!list.length) { toast("No jobs match that cutoff"); return; }
+  S.batch = { items: list.map(j => ({ title: j.title, company: j.company, state: "waiting", note: "" })), stop: false, running: true, min };
+  lsSet("batchPrefs", { min, max });
+  renderBatch(); keepAwake(true);
+  for (let i = 0; i < list.length; i++) {
+    if (S.batch.stop) { S.batch.items.slice(i).forEach(it => it.state = "cancelled"); break; }
+    const it = S.batch.items[i], j = list[i];
+    it.state = "working"; it.note = "Getting the full description…"; renderBatch();
+    try {
+      let a = S.apps.find(x => jobKey(x) === jobKey(j));
+      a = a ? clean(strip(a)) : jobToApp(j);
+      if ((a.posting || "").length < 200) { const d = await fetchDetails(a, j); a.posting = d.text; if (d.partial) throw { code: "partial", message: "Only a short summary was available. Open it and paste the full description." }; }
+      const r = await runKit(a, t => { it.note = t; renderBatch(); }, { minScore: min });
+      it.state = r; it.note = r === "ready" ? `Fit ${a.score}. CV, cover letter and form answers ready.` : a.kitNote; it.id = a.id;
+    } catch (e) { it.state = "error"; it.note = e && e.code === "partial" ? e.message : sampleErr(e) || mcpErr(e, j.src); }
+    renderBatch();
+  }
+  S.batch.running = false; keepAwake(false); renderBatch(); renderResults();
+  toast("Application kits done");
+}
+const BATCH_PILL = { waiting: ["plain", "Waiting"], working: ["info", "Working"], ready: ["good", "Ready"], skipped: ["plain", "Skipped"], stopped: ["bad", "Stopped"], error: ["bad", "Problem"], cancelled: ["plain", "Cancelled"] };
+function renderBatch() {
+  const box = $("#batchBox"); if (!box) return;
+  const b = S.batch;
+  if (!b) { box.innerHTML = ""; return; }
+  box.innerHTML = `<div class="card"><div class="row"><span class="eyebrow grow">Application kits</span>${b.running ? `<button class="btn sm ghost" data-act="batchStop">Stop after this one</button>` : `<button class="btn sm ghost" data-act="batchClear">Clear</button>`}</div>
+    ${b.running ? `<p class="small muted">Keep this screen open. Each job takes 2-4 minutes. Finished ones are saved to your Tracker as they complete.</p>` : ""}
+    <div class="stack">${b.items.map(it => { const [c, l] = BATCH_PILL[it.state]; return `<div class="row" style="align-items:flex-start"><span class="pill ${c}">${l}</span><div class="grow"><div style="font-weight:700">${esc(it.title)}</div><div class="small muted">${esc(it.company)}${it.note ? " · " + esc(it.note) : ""}</div></div>${it.state === "ready" && it.id ? `<button class="btn sm primary" data-act="open" data-id="${esc(it.id)}">Open</button>` : ""}</div>`; }).join("")}</div></div>`;
+}
+
+
+async function reviseDocs(instruction, which, handledFlag) {
   const a = S.current; if (!a || !a.docs || !instruction.trim()) return;
-  S.busy.revise = true; a.reviseErr = ""; renderApply();
+  S.busy.revise = true; a.reviseErr = ""; renderApply.force = true; renderApply();
   try {
     const out = await ask("json", `Revise this job application per the candidate's instruction. Change only what the instruction asks${which ? ` (focus: ${which})` : ""}; keep everything else as is.
 
@@ -833,10 +932,10 @@ Reply with only JSON in exactly this shape:
 ${DOC_SHAPE}`, { modelTier: "default", cache: false });
     if (!out || !out.cv || !out.cover) throw { code: "invalid_json" };
     a.docs = deepNoDash({ cv: out.cv, cover: out.cover });
-    a.flags = (out.stretch_flags || []).filter(f => f && f.text);
+    a.flags = (out.stretch_flags || []).filter(f => f && f.text && f.text !== handledFlag);
     await store.saveApp(a); toast("Updated");
   } catch (e) { a.reviseErr = sampleErr(e); }
-  S.busy.revise = false; renderApply();
+  S.busy.revise = false; S.reviseLabel = ""; renderApply.force = true; renderApply();
 }
 
 async function answerFormQuestion() {
@@ -983,6 +1082,17 @@ function renderApply() {
       ${a.url ? `<a class="btn sm" href="${esc(a.url)}" target="_blank" rel="noopener" style="align-self:flex-start">Open original posting ↗</a>` : ""}
     </div>`;
 
+  if (a.docs && a.ready !== false && a.status !== "applied" && !FINAL.has(a.status) && a.status !== "interview" && a.status !== "offer") {
+    html += `<div class="card"><span class="eyebrow">Ready to send</span>
+      <ol class="clean" style="padding-left:1.2em;gap:10px">
+        <li><div class="row"><span class="grow">Open the posting and start the application</span>${a.url ? `<a class="btn sm" href="${esc(a.url)}" target="_blank" rel="noopener">Open ↗</a>` : `<span class="small muted">No link saved</span>`}</div></li>
+        <li><div class="row"><span class="grow">Attach your CV</span><button class="btn sm" data-act="docx" data-v="cv">Word file</button></div></li>
+        <li><div class="row"><span class="grow">Attach your cover letter</span><button class="btn sm" data-act="docx" data-v="cover">Word file</button><button class="btn sm ghost" data-act="copyDoc" data-v="cover">Copy</button></div></li>
+        ${(a.answers || []).length ? `<li><span>Paste the form answers</span><div class="stack" style="margin-top:6px">${a.answers.map((x, i) => `<details class="fold note"><summary style="font-weight:700;font-size:.9rem">${esc(x.q)}</summary><div style="white-space:pre-wrap;margin-top:6px">${esc(x.a)}</div><button class="btn sm" data-act="copyAns" data-i="${i}" style="margin-top:6px">Copy answer</button></details>`).join("")}</div></li>`
+          : `<li><div class="row"><span class="grow">Form answers</span>${S.busy.answers ? working("Writing…") : `<button class="btn sm" data-act="answers">Pre-write them</button>`}</div></li>`}
+        <li><div class="row"><span class="grow">Submitted it?</span><button class="btn sm primary" data-act="markApplied">Mark applied</button></div></li>
+      </ol></div>`;
+  }
   html += `<div class="card"><details class="fold" ${!ev ? "open" : ""}><summary>Job posting</summary><div class="stack" style="margin-top:10px">
       ${a.fetching ? working("Getting the full description…") : ""}
       ${a.fetchNote ? `<div class="note warn small">${esc(a.fetchNote)}</div>` : ""}
@@ -991,7 +1101,11 @@ function renderApply() {
       <label class="f" for="ap-url">Posting link (optional)<input type="text" id="ap-url" value="${esc(a.url)}" inputmode="url"></label>
       <label class="f" for="posting">Full job description<textarea id="posting" class="tall" placeholder="Paste the whole posting: responsibilities, requirements, benefits, who can apply.">${esc(a.posting)}</textarea></label>
     </div></details>
-    ${S.busy.eval ? working("Claude is scoring the fit. This takes 20-60 seconds…") : `<button class="btn ${ev ? "" : "primary"} block" data-act="evaluate">${ev ? "Re-check fit" : "Check my fit"}</button>`}
+    ${S.busy.kit ? `<div class="working"><span class="spin"></span><span id="kitStage">${esc(a.kitStage || "Working…")}</span></div><p class="small muted">The whole thing takes 2-4 minutes. Keep this screen open.</p>`
+      : S.busy.eval ? working("Claude is scoring the fit. This takes 20-60 seconds…")
+      : `${!a.ready ? `<button class="btn primary block" data-act="kit">Do it all: fit check, CV, cover letter, form answers</button>` : ""}
+         <button class="btn ${ev || !a.ready ? "" : "primary"} block" data-act="evaluate">${ev ? "Re-check fit" : "Just check my fit"}</button>`}
+    ${a.kitErr ? `<div class="note bad small">${esc(a.kitErr)}</div>` : ""}${a.kitNote ? `<div class="note warn small">${esc(a.kitNote)}</div>` : ""}
     ${a.evalErr ? `<div class="note bad small">${esc(a.evalErr)}</div>` : ""}</div>`;
 
   if (ev) {
@@ -1020,8 +1134,11 @@ function renderApply() {
         ${v === "cv" ? cvHTML(a.docs.cv) : coverHTML(a.docs.cover, p)}
         ${v === "cover" ? `<div class="wc">${words(a.docs.cover)} words of body text (target 250-300)</div>` : ""}
         <div class="row"><button class="btn sm primary" data-act="docx" data-v="${v}">Download Word file</button><button class="btn sm" data-act="copyDoc" data-v="${v}">Copy text</button></div>
-        ${(a.flags || []).length ? `<div class="stack"><h3>Check these lines</h3><p class="small muted">These are a stretch. You decide: keep, soften, or drop.</p>${a.flags.map((f, i) => `<div class="flag"><div>“${esc(f.text)}”</div><div class="muted small">${esc(f.why)}</div>
-          <div class="row"><button class="btn sm" data-act="flag" data-k="keep" data-i="${i}">Keep</button><button class="btn sm" data-act="flag" data-k="soften" data-i="${i}">Soften</button><button class="btn sm danger" data-act="flag" data-k="drop" data-i="${i}">Drop</button></div></div>`).join("")}</div>` : ""}
+        ${(a.flags || []).length || S.busy.revise ? `<div class="stack" id="flagBox"><h3>Check these lines</h3><p class="small muted">These are a stretch. You decide: keep, soften, or drop.</p>
+          ${S.busy.revise ? `<div class="working"><span class="spin"></span><span>${esc(S.reviseLabel || "Updating your documents…")} This takes 30-90 seconds.</span></div>` : ""}
+          ${a.reviseErr ? `<div class="note bad small">${esc(a.reviseErr)}</div>` : ""}
+          ${(a.flags || []).map((f, i) => `<div class="flag"><div>“${esc(f.text)}”</div><div class="muted small">${esc(f.why)}</div>
+          <div class="row"><button class="btn sm" data-act="flag" data-k="keep" data-i="${i}" ${S.busy.revise ? "disabled" : ""}>Keep</button><button class="btn sm" data-act="flag" data-k="soften" data-i="${i}" ${S.busy.revise ? "disabled" : ""}>Soften</button><button class="btn sm danger" data-act="flag" data-k="drop" data-i="${i}" ${S.busy.revise ? "disabled" : ""}>Drop</button></div></div>`).join("")}</div>` : ""}
         <details class="fold"><summary>Change something</summary><div class="stack" style="margin-top:8px">
           <label class="f" for="reviseBox">Tell Claude what to change<textarea id="reviseBox" placeholder="e.g. Make the cover letter warmer and mention my forklift certification. Shorten the CV summary."></textarea></label>
           ${S.busy.revise ? working("Revising…") : `<button class="btn primary" data-act="revise">Apply changes</button>`}
@@ -1047,9 +1164,9 @@ function renderApply() {
 }
 
 /* ---------- TRACKER ---------- */
-const STATUSES = ["saved", "drafted", "applied", "interview", "offer", "hired", "rejected", "no_response", "offer_declined", "withdrawn"];
-const FINAL = new Set(["hired", "rejected", "no_response", "offer_declined", "withdrawn"]);
-const STATUS_CLS = { saved: "plain", drafted: "info", applied: "info", interview: "warn", offer: "good", hired: "good", rejected: "bad", no_response: "plain", offer_declined: "plain", withdrawn: "plain" };
+const STATUSES = ["saved", "skipped", "drafted", "applied", "interview", "offer", "hired", "rejected", "no_response", "offer_declined", "withdrawn"];
+const FINAL = new Set(["skipped", "hired", "rejected", "no_response", "offer_declined", "withdrawn"]);
+const STATUS_CLS = { saved: "plain", skipped: "plain", drafted: "info", applied: "info", interview: "warn", offer: "good", hired: "good", rejected: "bad", no_response: "plain", offer_declined: "plain", withdrawn: "plain" };
 function lastContact(a) { const ds = [a.appliedAt, ...((a.notes || "").match(/followed up (\d{4}-\d{2}-\d{2})/g) || []).map(s => s.slice(-10))].filter(Boolean).sort(); return ds[ds.length - 1] || null; }
 function followUps(a) { return ((a.notes || "").match(/followed up \d{4}-\d{2}-\d{2}/g) || []).length; }
 function renderTracker() {
@@ -1069,7 +1186,7 @@ function renderTracker() {
     const open = S.openApp === a.id;
     return `<div class="app"><button class="hd" data-act="toggleApp" data-id="${esc(a.id)}" aria-expanded="${open}">
       <div class="grow" style="flex:1;min-width:0"><div style="font-weight:700">${esc(a.role)}</div><div class="small muted">${esc(a.company)}</div>
-      <div class="row" style="margin-top:6px"><span class="pill ${STATUS_CLS[a.status] || "plain"}">${esc((a.status || "saved").replace("_", " "))}</span>${dlTag}${qTag}</div></div>
+      <div class="row" style="margin-top:6px"><span class="pill ${STATUS_CLS[a.status] || "plain"}">${esc((a.status || "saved").replace("_", " "))}</span>${a.ready && a.status === "drafted" ? `<span class="pill good">Ready to send</span>` : ""}${dlTag}${qTag}</div></div>
       ${a.score != null ? `<span class="fit ${fitClass(a.score)}">${a.score}</span>` : ""}</button>
       ${open ? `<div class="bd">
         <label class="f" for="st-${esc(a.id)}">Status<select id="st-${esc(a.id)}" data-act="status" data-id="${esc(a.id)}">${STATUSES.map(s => `<option value="${s}" ${a.status === s ? "selected" : ""}>${s.replace("_", " ")}</option>`).join("")}</select></label>
@@ -1393,7 +1510,7 @@ function setSync() {
 function showBanner(html, kind) { const b = $("#banner"); b.className = "note " + (kind || ""); b.innerHTML = html; b.hidden = false; }
 function refreshAll() {
   $("#needProfile").hidden = !!profileReady() || !S.profile;
-  if (S.tab === "find") { renderAuto(); renderResults(); }
+  if (S.tab === "find") { renderAuto(); renderBatch(); renderResults(); }
   if (S.tab === "apply") renderApply();
   if (S.tab === "tracker") renderTracker();
   if (S.tab === "interview") renderInterview();
@@ -1418,6 +1535,13 @@ document.addEventListener("click", async e => {
     case "open": openApp(id); break;
     case "closeApp": syncApplyInputs(); S.current = null; S.currentId = null; renderApply.force = true; renderApply(); break;
     case "evaluate": evaluate(); break;
+    case "kit": kitForCurrent(); break;
+    case "pickKit": pickJob(Number(t.dataset.i), false, true); break;
+    case "batch": runBatch(); break;
+    case "batchStop": if (S.batch) { S.batch.stop = true; toast("Stopping after the current job"); } break;
+    case "batchClear": S.batch = null; renderBatch(); break;
+    case "copyAns": copyText(a.answers[Number(t.dataset.i)].a); break;
+    case "answers": S.busy.answers = true; renderApply.force = true; renderApply(); try { await answersCore(a); await store.saveApp(a); } catch (e) { toast(sampleErr(e)); } S.busy.answers = false; renderApply.force = true; renderApply(); break;
     case "draft": draftDocs(false); break;
     case "draftAnyway": draftDocs(true); break;
     case "redraft": if (a) { a.docs = null; a.flags = []; a.review = []; draftDocs(!!(a.eval && hardStop(a.eval))); } break;
@@ -1427,7 +1551,7 @@ document.addEventListener("click", async e => {
     case "revise": { const v = $("#reviseBox").value; if (!v.trim()) { $("#reviseBox").focus(); return; } reviseDocs(v); break; }
     case "flag": { const f = a.flags[Number(t.dataset.i)]; if (!f) return; const k = t.dataset.k;
       if (k === "keep") { a.flags.splice(Number(t.dataset.i), 1); await store.saveApp(a); renderApply.force = true; renderApply(); }
-      else reviseDocs(k === "drop" ? `Remove this line entirely and don't replace it with anything similar: "${f.text}"` : `Soften this line so it claims only what the profile clearly supports: "${f.text}"`);
+      else { S.reviseLabel = k === "drop" ? "Dropping that line and tidying the documents…" : "Softening that line…"; const done = f.text; reviseDocs(k === "drop" ? `Remove this line entirely and don't replace it with anything similar: "${f.text}"` : `Soften this line so it claims only what the profile clearly supports: "${f.text}"`, null, done); }
       break; }
     case "formAnswer": answerFormQuestion(); break;
     case "copyForm": copyText(a.formAnswer); break;
@@ -1458,6 +1582,7 @@ document.addEventListener("click", async e => {
 document.addEventListener("change", async e => {
   const t = e.target;
   if (t.id === "ivPick") { S.interviewId = t.value; renderInterview(); return; }
+  if (t.id === "batchMin" || t.id === "batchMax") { lsSet("batchPrefs", { min: Number($("#batchMin").value), max: Number($("#batchMax").value) }); renderResults(); return; }
   if (t.dataset.act === "status") { const x = S.apps.find(z => z.id === t.dataset.id); x.status = t.value; if (t.value === "applied" && !x.appliedAt) x.appliedAt = today(); await store.saveApp(x); toast("Status updated"); renderTracker(); }
   if (t.dataset.act === "deadline") { const x = S.apps.find(z => z.id === t.dataset.id); const v = t.value.trim(); if (v && !/^\d{4}-\d{2}-\d{2}$/.test(v)) { toast("Use the format YYYY-MM-DD"); return; } x.deadline = v; await store.saveApp(x); toast("Deadline saved"); }
   if (t.id === "resumeFile" && t.files[0]) { const f = t.files[0]; t.value = ""; uploadResume(f); return; }

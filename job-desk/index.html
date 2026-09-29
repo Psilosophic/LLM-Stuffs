@@ -477,18 +477,42 @@ function mcpErr(e, server) {
     case "not_in_manifest": case "consent_required": return `${server} isn't allowed for this page. Reload and tap Allow when asked.`;
     case "server_unavailable": return `${server} didn't answer. Try again in a minute.`;
     case "blocked_by_policy": case "approval_required": return `${server} is blocked by your organization's settings.`;
+    case "board_busy": return `${server} is limiting how fast we can search, so some ${server} results were skipped. Run it again in a minute to fill them in.`;
     case "tool_error": return `${server} reported an error: ${e.message || "unknown"}`;
     case "not_granted": case "capability_disabled": case "capability_removed": return `Job boards only work when this page is open inside Claude.`;
     default: return `${server} failed: ${(e && e.message) || "unknown error"}`;
   }
 }
+/* each board gets its own speed limit; Indeed throttles hard ("Rate limit exceeded... try again in N seconds") */
+const BOARD_LIMIT = { Indeed: 2, Dice: 4, ZipRecruiter: 3 };
+const lanes = {};
+async function inLane(server, fn) {
+  const L = lanes[server] || (lanes[server] = { active: 0, wait: [], nextAt: 0 });
+  const max = BOARD_LIMIT[server] || 3;
+  if (L.active >= max) await new Promise(r => L.wait.push(r));
+  L.active++;
+  try {
+    const gap = L.nextAt - Date.now(); if (gap > 0) await sleep(gap);
+    return await fn();
+  } finally { L.active--; const next = L.wait.shift(); if (next) next(); }
+}
+const isRateLimit = e => e && (e.code === "rate_limited" || /rate limit|-32429|too many requests/i.test(String(e.message || "")));
 async function callBoard(server, tool, input) {
   if (!cap.mcp) throw { code: "capability_disabled" };
   const o = tool === "get_resume" ? {} : { cache: { staleTime: 300000, gcTime: 3600000 } };
-  try { return (await cap.mcp.callTool(server, tool, input, o)).payload; }
-  catch (e) {
-    if (e && e.retryable) { await sleep((e.retryAfterMs || 1200) + Math.random() * 800); return (await cap.mcp.callTool(server, tool, input, o)).payload; }
-    throw e;
+  for (let attempt = 0; ; attempt++) {
+    try { return await inLane(server, async () => (await cap.mcp.callTool(server, tool, input, o)).payload); }
+    catch (e) {
+      if (isRateLimit(e) && attempt < 4) {
+        const m = String(e.message || "").match(/in (\d+(?:\.\d+)?) ?s/i);
+        const wait = (m ? parseFloat(m[1]) * 1000 : 2000) * (attempt + 1) + Math.random() * 700;
+        const L = lanes[server]; if (L) L.nextAt = Math.max(L.nextAt, Date.now() + wait); /* slow the whole lane down, not just this call */
+        await sleep(wait); continue;
+      }
+      if (e && e.retryable && attempt < 1) { await sleep((e.retryAfterMs || 1200) + Math.random() * 800); continue; }
+      if (isRateLimit(e)) throw { code: "board_busy", server, message: e.message };
+      throw e;
+    }
   }
 }
 const na = v => (!v || /^n\/?a$/i.test(String(v).trim())) ? "" : String(v).trim();
@@ -648,7 +672,7 @@ function renderResults() {
   const pr = S.progress || { done: 0, total: 0 };
   const st = (S.busy.search ? working(`Searching ${esc(S.lastRunLabel || "")}… ${pr.done} of ${pr.total} searches done`) : S.busy.enrich ? working(`Reading full job descriptions… ${pr.done} of ${pr.total}`) : "")
     + `<div class="small muted">${Object.entries(S.srcStatus).filter(([, v]) => v.n).map(([s, v]) => `${esc(s)}: ${v.n}`).join(" · ")}</div>`
-    + Object.entries(S.srcStatus).filter(([, v]) => v.state !== "busy" && !v.ok).map(([, v]) => `<div class="note bad small">${esc(v.errs[0] || "")}</div>`).join("");
+    + Object.entries(S.srcStatus).filter(([, v]) => v.state !== "busy" && v.errs && v.errs.length).map(([, v]) => `<div class="note ${v.ok ? "warn" : "bad"} small">${esc(v.errs[0] || "")}</div>`).join("");
   if (!S.results.length) {
     box.innerHTML = st ? `<div class="card">${st}</div>` : (S.busy.search ? "" : `<div class="card"><span class="eyebrow">How this works</span>
       <p>Search Indeed, Dice and ZipRecruiter at once. Tap <b>Rank for me</b> to score every result against your profile, then <b>Check fit</b> on the ones worth a look.</p>

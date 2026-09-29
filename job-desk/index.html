@@ -325,7 +325,7 @@ const store = {
       this.col = cap.db.collection("data/users/" + uid);
       this.col.onSnapshot(snap => {
         let prof = null; const apps = [];
-        snap.docs.forEach(d => { const v = d.data(); if (!v) return; if (d.id === "profile") prof = v; else if (v.kind === "app") apps.push({ ...v, id: d.id }); });
+        snap.docs.forEach(d => { const raw = d.data(); if (!raw) return; const v = clean(raw); /* snapshots are frozen: edit a copy */ if (d.id === "profile") prof = v; else if (v.kind === "app") apps.push({ ...v, id: d.id }); });
         S.profile = prof || S.profile || blankProfile();
         S.apps = apps;
         if (S.currentId && !S.applyDirty && !S.busy.draft && !S.busy.eval && !S.busy.revise && !S.busy.form) { const a = apps.find(x => x.id === S.currentId); if (a) S.current = a; }
@@ -1397,6 +1397,10 @@ $("#fillFromResume").addEventListener("click", () => {
   extractProfile(txt, "paste");
 });
 $("#exportBtn").addEventListener("click", () => saveFile(`pocket-job-desk-backup-${today()}.json`, JSON.stringify({ app: "pocket-job-desk", version: 1, exported: today(), profile: S.profile, apps: S.apps }, null, 1)));
+
+/* never fail silently */
+window.addEventListener("unhandledrejection", e => { console.error(e.reason); Object.keys(S.busy).forEach(k => S.busy[k] = false); toast("Something went wrong. Tap it again, or reload the page."); refreshAll(); });
+window.addEventListener("error", e => { console.error(e.error || e.message); toast("Something went wrong. Reload the page and try again."); });
 
 /* ---------- boot ---------- */
 (function restoreSearch() { const s = lsGet("search"); if (s) { $("#q").value = s.q || ""; $("#loc").value = s.loc || ""; $("#remote").checked = !!s.remote; $("#recent").checked = !!s.recent; } })();

@@ -178,7 +178,7 @@ nav.tabs button:focus-visible{outline:3px solid var(--accent);outline-offset:-4p
     <div id="needProfile" class="card" hidden>
       <span class="eyebrow">Step 1</span>
       <h2>Tell it who you are first</h2>
-      <p class="muted">Fit scores, CVs and cover letters are built only from your profile. Paste your resume once and you're set.</p>
+      <p class="muted">Fit scores, CVs and cover letters are built only from your profile. Upload your resume, then answer a 10-minute interview. No forms.</p>
       <button class="btn primary" data-go="profile">Set up my profile</button>
     </div>
     <form class="card" id="searchForm">
@@ -214,16 +214,25 @@ nav.tabs button:focus-visible{outline:3px solid var(--accent);outline-offset:-4p
 
   <!-- PROFILE -->
   <section data-tab="profile" hidden>
+    <div class="card" id="profileStatus"></div>
     <div class="card">
-      <span class="eyebrow">Your profile</span>
-      <p class="muted small">This is the only thing Claude is allowed to use as facts about you. Anything missing here can't go in a CV. The more you give it, the better it gets.</p>
+      <span class="eyebrow">Step 1 · Give it your resume</span>
+      <p class="muted small">Use your real resume file if you have one. It has your contact details and achievements, which Indeed's copy leaves out. You can do both.</p>
       <div class="row">
-        <button class="btn sm" id="importIndeed" type="button">Import my Indeed resume</button>
-        <button class="btn sm" id="fillFromResume" type="button">Fill fields from resume text</button>
+        <label class="btn sm primary" for="resumeFile">Upload resume (PDF or Word)</label>
+        <input type="file" id="resumeFile" accept=".pdf,.docx,.txt,.md,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/plain" hidden>
+        <button class="btn sm" id="importIndeed" type="button">Import from Indeed</button>
       </div>
       <div id="profileMsg"></div>
     </div>
-    <form class="card" id="profileForm"></form>
+    <div class="card" id="setupCard"></div>
+    <div class="card">
+      <details class="fold" id="manualFold"><summary>Edit details by hand</summary>
+        <p class="muted small" style="margin-top:6px">You shouldn't need this. The interview fills it in. It's here if you want to fix one thing.</p>
+        <div class="row" style="margin-top:8px"><button class="btn sm" id="fillFromResume" type="button">Re-read the resume box</button></div>
+        <form id="profileForm" class="stack" style="margin-top:10px"></form>
+      </details>
+    </div>
     <div class="card">
       <span class="eyebrow">Your data</span>
       <p class="muted small" id="storageNote"></p>
@@ -332,6 +341,7 @@ const store = {
   },
   async saveProfile(p) {
     p.updatedAt = Date.now(); S.profile = p;
+    if (p.setupChat && p.setupChat.length > 80) p.setupChat = p.setupChat.slice(-80);
     if (S.mode === "cloud") await this.col.doc("profile").set(clean(p)); else lsSet("profile", p);
   },
   async saveApp(a) {
@@ -1079,19 +1089,25 @@ async function extractProfile(sourceText, from) {
   const msg = $("#profileMsg");
   msg.innerHTML = working(from === "indeed" ? "Reading your Indeed resume…" : "Reading your resume…");
   try {
-    const out = await ask("json", `Extract a job-seeker profile from this resume. Only use what is actually written; leave a field "" if it isn't there. Put the complete work history, education, skills, certifications and achievements into "resume" as clean plain text (keep every job, date and metric; do not summarize away detail).
-
-RESUME:
-${sourceText.slice(0, 60000)}
-
+    const prev = (S.profile && S.profile.resume || "").trim();
+    const out = await ask("json", `Extract a job-seeker profile from a new resume source and merge it with what we already have. Only use what is actually written; leave a field "" if it isn't there.
+"resume" must be ONE complete clean plain-text resume: every job (title, company, location, dates) with its bullets, education, skills, certifications, awards. Merge the existing resume text and the new source: keep every fact from both, remove duplicates, prefer the more detailed version, keep all numbers. Do not summarize detail away and do not invent anything.
 If the source lists job-search preferences (preferred titles, minimum salary, max commute, remote), map them to targetRoles, salary, commute and workPref.
+
+EXISTING RESUME TEXT:
+${prev.slice(0, 30000) || "(none yet)"}
+
+NEW SOURCE (${from}):
+${sourceText.slice(0, 60000)}
 
 Reply with only JSON: {"name":"","email":"","phone":"","linkedin":"","location":"","targetRoles":"","languages":"","salary":"","commute":"","workPref":"","resume":""}`, { modelTier: "default", cache: false });
     const p = readProfileForm();
     const blank = blankProfile();
     Object.entries(out || {}).forEach(([k, v]) => { if (k in blank && typeof v === "string" && v.trim() && (k === "resume" || !p[k] || p[k] === blank[k])) p[k] = v.trim(); });
-    S.profile = p; renderProfileFormForce(); S.profileDirty = true;
-    msg.innerHTML = `<div class="note good small">Filled in what I could find. Check it, then tap <b>Save profile</b>.${from === "indeed" ? " Indeed only shares job titles and dates, so add what you did and achieved at each job to the resume box. Claude can only put on your CV what's written there." : ""}</div>`;
+    p.resumeSource = [...new Set([...(S.profile?.resumeSource || "").split(",").filter(Boolean), from])].join(",");
+    await store.saveProfile(p); renderProfileFormForce(); renderProfileStatus();
+    msg.innerHTML = `<div class="note good small">Got it and saved. Now do the interview below so it can fill in the rest${from === "indeed" ? ". Indeed only shares titles and dates, so the interview will ask what you actually did at each job" : ""}.</div>`;
+    renderSetup();
   } catch (e) { msg.innerHTML = `<div class="note bad small">${esc(sampleErr(e))}</div>`; }
 }
 function renderProfileFormForce() { const f = $("#profileForm"); if (document.activeElement && f.contains(document.activeElement)) document.activeElement.blur(); S.profileDirty = false; f.innerHTML = ""; renderProfileForm(); }
@@ -1104,6 +1120,164 @@ async function importIndeed() {
     if (!text || text.length < 40) { msg.innerHTML = `<div class="note warn small">Indeed didn't return a resume. Paste yours into the resume box instead.</div>`; return; }
     await extractProfile(text, "indeed");
   } catch (e) { msg.innerHTML = `<div class="note bad small">${esc(mcpErr(e, "Indeed"))} Or paste your resume into the box below.</div>`; }
+}
+
+/* ---------- resume file upload (PDF / Word / text) ---------- */
+function loadScript(src) {
+  return new Promise((res, rej) => { if ($(`script[src="${src}"]`)) return res(); const s = document.createElement("script"); s.src = src; s.onload = res; s.onerror = () => { s.remove(); rej(new Error("load")); }; document.head.appendChild(s); });
+}
+async function fileToText(file) {
+  const name = (file.name || "").toLowerCase();
+  if (name.endsWith(".pdf") || file.type === "application/pdf") {
+    const base = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/";
+    await loadScript(base + "pdf.min.js");
+    await loadScript(base + "pdf.worker.min.js");
+    const lib = window.pdfjsLib;
+    lib.GlobalWorkerOptions.workerSrc = base + "pdf.worker.min.js";
+    const pdf = await lib.getDocument({ data: new Uint8Array(await file.arrayBuffer()) }).promise;
+    let out = "";
+    for (let i = 1; i <= Math.min(pdf.numPages, 12); i++) {
+      const tc = await (await pdf.getPage(i)).getTextContent();
+      let lastY = null;
+      for (const it of tc.items) { const y = it.transform ? Math.round(it.transform[5]) : null; if (lastY !== null && y !== lastY) out += "\n"; else if (out && !out.endsWith(" ")) out += " "; out += it.str; lastY = y; }
+      out += "\n\n";
+    }
+    const links = [];
+    for (let i = 1; i <= Math.min(pdf.numPages, 3); i++) (await (await pdf.getPage(i)).getAnnotations()).forEach(a => a.url && links.push(a.url));
+    return out.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim() + (links.length ? "\n\nLinks in the document: " + [...new Set(links)].join(" ") : "");
+  }
+  if (name.endsWith(".docx")) {
+    await loadScript("https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js");
+    const r = await window.mammoth.extractRawText({ arrayBuffer: await file.arrayBuffer() });
+    return (r.value || "").trim();
+  }
+  if (name.endsWith(".doc")) throw new Error("olddoc");
+  return (await file.text()).trim();
+}
+async function uploadResume(file) {
+  const msg = $("#profileMsg");
+  msg.innerHTML = working("Opening your file…");
+  let text = "";
+  try { text = await fileToText(file); }
+  catch (e) { msg.innerHTML = `<div class="note bad small">${e.message === "olddoc" ? "That's an old .doc file. Save it as .docx or PDF and upload that." : "Couldn't open that file. Try a PDF or .docx, or check your connection."}</div>`; return; }
+  if (text.length < 100) { msg.innerHTML = `<div class="note warn small">I couldn't find any text in that file. If it's a scanned image, export a text PDF or .docx from Word, Pages or Google Docs instead.</div>`; return; }
+  await extractProfile(text, "file");
+}
+
+/* ---------- setup interview (the original /setup "Path C") ---------- */
+const CHECKS = [
+  ["Contact details", p => p.name && (p.email || p.phone)],
+  ["Work history with achievements", p => (p.resume || "").length > 1200],
+  ["Jobs you want", p => !!p.targetRoles],
+  ["Location & commute", p => p.location && (p.commute || /remote/i.test(p.workPref))],
+  ["Work authorization", p => !!p.workAuth],
+  ["Languages", p => !!p.languages],
+  ["Career goals", p => !!p.goals],
+  ["What energizes / drains you", p => p.energizers && p.drainers],
+  ["How you work best", p => !!p.style],
+  ["Deal-breakers", p => !!p.dealbreakers],
+  ["Salary", p => !!p.salary]
+];
+function renderProfileStatus() {
+  const p = S.profile || blankProfile(), done = CHECKS.filter(([, f]) => f(p)).length;
+  $("#profileStatus").innerHTML = `<div class="row"><span class="eyebrow grow">Your profile</span><span class="wc">${done} of ${CHECKS.length} done</span></div>
+    <div class="track" style="height:8px;border-radius:4px;background:var(--sunken);overflow:hidden"><i style="display:block;height:100%;width:${Math.round(done / CHECKS.length * 100)}%;background:var(--good)"></i></div>
+    <div class="row">${CHECKS.map(([l, f]) => `<span class="pill ${f(p) ? "good" : "plain"}">${f(p) ? "✓ " : ""}${esc(l)}</span>`).join("")}</div>
+    <p class="muted small">This is the only thing Claude may use as facts about you. Anything missing can't go on a CV.</p>`;
+}
+function setupRules() {
+  const p = { ...(S.profile || {}) }; delete p.setupChat;
+  return `You are running the onboarding interview for a job-search assistant, on a PHONE. Your job: fill the gaps in this person's profile through a relaxed conversation, the way a good career coach would. Never make them fill in a form.
+
+HOW TO TALK
+- ONE question per message (you may bundle 2-3 tiny related facts, like "What's your LinkedIn URL and what city are you in?"). Keep each message under 60 words.
+- Casual, warm, direct. They can answer in fragments or dictate; you do the structuring.
+- NEVER ask for anything already in the profile below. Start by saying in one line what you already have, then ask the first gap.
+- If they say "skip" or "don't know", move on.
+- Keep a running sense of progress, e.g. "(3 of ~10)".
+
+WHAT TO COVER, IN THIS ORDER, SKIPPING WHAT'S KNOWN
+1. Contact: full name, city/state, phone, email, LinkedIn URL. Current employment status.
+2. Work history depth: for the 3-4 most recent or relevant jobs, ask what they actually did and what came of it (numbers, scale, tools, who they helped, problems solved). One job per question. Dig once for a concrete result if the answer is vague ("Roughly how many people or tickets or dollars?"). Older jobs: one quick question covering all of them.
+3. Education and certifications not already listed.
+4. Languages they work in and honest level (a posting requiring an unlisted language gets auto-excluded, so honesty matters).
+5. Work authorization (citizen / needs sponsorship).
+6. How they work best: environments they thrive in, team style, communication style, any personality assessment results.
+7. What energizes them and what drains them at work.
+8. Career direction: what they want to be doing day to day. Then turn that into 3-8 concrete job titles to search, and SUGGEST 2-3 adjacent role types they may not have considered based on their skills.
+9. Deal-breakers, location/commute/remote limits, salary floor.
+
+When everything important is covered, say so in one line and tell them to tap "Finish & save profile". End that message with the token [[READY]].
+
+CURRENT PROFILE (JSON):
+${JSON.stringify(p).slice(0, 40000)}`;
+}
+function renderSetup() {
+  const box = $("#setupCard"); if (!box) return;
+  if (box.contains(document.activeElement) && document.activeElement.id === "setupIn") return;
+  const chat = (S.profile && S.profile.setupChat) || [];
+  const ready = chat.length && /\[\[READY\]\]/.test(chat[chat.length - 1].content);
+  const answered = chat.filter(m => m.role === "user").length;
+  box.innerHTML = `<span class="eyebrow">Step 2 · Quick interview</span>
+    ${!chat.length && !S.busy.setup ? `<h2>Let Claude interview you</h2><p class="muted small">It already knows your resume, so it only asks about what's missing: one question at a time, about 10 minutes. Tap the mic on your keyboard to talk instead of typing. When you're done, it fills in your whole profile.</p>
+      <button class="btn primary block" data-act="setupStart">Start the interview</button>` : ""}
+    <div class="chat">${chat.map(m => `<div class="bub ${m.role === "user" ? "u" : "a"}">${esc(m.content.replace(/\s*\[\[READY\]\]\s*/g, ""))}</div>`).join("")}${S.busy.setup ? `<div class="bub a" id="setupLive">${S.setupLive ? esc(S.setupLive.replace(/\s*\[\[READY\]\]\s*/g, "")) : "Thinking…"}</div>` : ""}</div>
+    ${S.setupErr ? `<div class="note bad small">${esc(S.setupErr)}</div>` : ""}
+    ${S.busy.finish ? working("Writing your profile from the interview. About 30-60 seconds…") : ""}
+    ${S.setupDone ? `<div class="note good small">${esc(S.setupDone)}</div>` : ""}
+    ${chat.length && !S.busy.finish ? `<label class="f" for="setupIn">Your answer<textarea id="setupIn" placeholder="Type or tap the keyboard mic and talk"></textarea></label>
+      <div class="row"><button class="btn ${ready ? "" : "primary"} grow" data-act="setupSend" ${S.busy.setup ? "disabled" : ""}>Send</button>
+      ${answered ? `<button class="btn ${ready ? "primary" : ""} grow" data-act="setupFinish" ${S.busy.setup ? "disabled" : ""}>Finish &amp; save profile</button>` : ""}</div>
+      <div class="row"><span class="small muted grow">You can stop anytime. Finish saves what it has so far, and you can come back later.</span><button class="btn sm ghost" data-act="setupReset" ${S.busy.setup ? "disabled" : ""}>Start over</button></div>` : ""}`;
+}
+async function setupTurn(userText) {
+  const p = S.profile || blankProfile();
+  p.setupChat = p.setupChat || [];
+  if (userText) p.setupChat.push({ role: "user", content: userText });
+  S.busy.setup = true; S.setupErr = ""; S.setupDone = ""; S.setupLive = ""; renderSetup();
+  const turns = [{ role: "user", content: setupRules() }, ...p.setupChat.slice(-40)];
+  if (turns[turns.length - 1].role !== "user" || turns.length === 1) turns.push({ role: "user", content: "Start the interview." });
+  try {
+    const text = await ask("text", turns, { modelTier: "default", cache: false, onText: ({ text }) => { S.setupLive = text; const el = $("#setupLive"); if (el) el.textContent = text.replace(/\s*\[\[READY\]\]\s*/g, ""); } });
+    p.setupChat.push({ role: "assistant", content: noDash(text) });
+    S.profile = p; await store.saveProfile(p);
+  } catch (e) {
+    S.setupErr = sampleErr(e);
+    if (userText) { p.setupChat.pop(); setTimeout(() => { const el = $("#setupIn"); if (el) el.value = userText; }, 0); }
+  }
+  S.busy.setup = false; S.setupLive = ""; renderSetup();
+  $("#setupCard .chat")?.lastElementChild?.scrollIntoView({ block: "nearest" });
+}
+async function finishSetup() {
+  const p = S.profile || blankProfile(), chat = p.setupChat || [];
+  const pending = ($("#setupIn") || {}).value || "";
+  if (pending.trim()) chat.push({ role: "user", content: pending.trim() });
+  S.busy.finish = true; S.setupErr = ""; renderSetup();
+  const cur = { ...p }; delete cur.setupChat;
+  const keys = PROFILE_FIELDS.map(([k]) => k);
+  try {
+    const out = await ask("json", `Update a job seeker's profile using their onboarding interview. Combine the current profile with everything they said. Only use facts they actually gave; never invent. Write each field in their own voice as concise plain text (no markdown).
+- "resume": ONE complete plain-text resume. Keep every existing job, date, skill and certification, and weave the new details from the interview into bullets under the right job (action verb + what + result, keep their numbers). Include education and certifications.
+- "style": how they work best: environments, team and communication style, decision style, assessment results.
+- "targetRoles": comma-separated job titles to search, including any adjacent roles they agreed to.
+- Leave a field as it currently is if the interview didn't touch it.
+
+CURRENT PROFILE (JSON):
+${JSON.stringify(cur).slice(0, 40000)}
+
+INTERVIEW TRANSCRIPT:
+${chat.map(m => (m.role === "user" ? "THEM: " : "COACH: ") + m.content.replace(/\[\[READY\]\]/g, "")).join("\n").slice(-60000)}
+
+Reply with only JSON with exactly these string keys: ${JSON.stringify(keys)}`, { modelTier: "complex", cache: false });
+    const next = { ...p };
+    keys.forEach(k => { if (out && typeof out[k] === "string" && out[k].trim()) next[k] = noDash(out[k].trim()); });
+    next.setupChat = chat;
+    await store.saveProfile(next); S.profile = next;
+    renderProfileFormForce(); renderProfileStatus();
+    const left = CHECKS.filter(([, f]) => !f(next)).map(([l]) => l);
+    S.setupDone = left.length ? `Saved. Still thin: ${left.join(", ")}. Answer a few more questions anytime and tap Finish again.` : "Saved. Your profile is complete. Go to Find and search.";
+  } catch (e) { S.setupErr = sampleErr(e); }
+  S.busy.finish = false; renderSetup();
 }
 
 /* ---------- navigation + refresh ---------- */
@@ -1133,7 +1307,7 @@ function refreshAll() {
   if (S.tab === "apply") renderApply();
   if (S.tab === "tracker") renderTracker();
   if (S.tab === "interview") renderInterview();
-  if (S.tab === "profile") renderProfileForm();
+  if (S.tab === "profile") { renderProfileForm(); renderProfileStatus(); renderSetup(); }
 }
 
 /* ---------- events ---------- */
@@ -1177,6 +1351,10 @@ document.addEventListener("click", async e => {
     case "del": S.confirmDel = id; renderTracker(); break;
     case "delNo": S.confirmDel = null; renderTracker(); break;
     case "delYes": await store.deleteApp(id); if (S.currentId === id) { S.current = null; S.currentId = null; } S.confirmDel = null; S.openApp = null; toast("Deleted"); renderTracker(); break;
+    case "setupStart": setupTurn(""); break;
+    case "setupSend": { const v = $("#setupIn").value.trim(); if (!v) { $("#setupIn").focus(); return; } $("#setupIn").value = ""; setupTurn(v); break; }
+    case "setupFinish": finishSetup(); break;
+    case "setupReset": { const p = S.profile; p.setupChat = []; S.setupDone = ""; await store.saveProfile(p); renderSetup(); break; }
     case "prep": buildPrep(); break;
     case "copyPrep": copyText(interviewApp().prep); break;
     case "mockStart": mockTurn(""); break;
@@ -1190,6 +1368,7 @@ document.addEventListener("change", async e => {
   if (t.id === "ivPick") { S.interviewId = t.value; renderInterview(); return; }
   if (t.dataset.act === "status") { const x = S.apps.find(z => z.id === t.dataset.id); x.status = t.value; if (t.value === "applied" && !x.appliedAt) x.appliedAt = today(); await store.saveApp(x); toast("Status updated"); renderTracker(); }
   if (t.dataset.act === "deadline") { const x = S.apps.find(z => z.id === t.dataset.id); const v = t.value.trim(); if (v && !/^\d{4}-\d{2}-\d{2}$/.test(v)) { toast("Use the format YYYY-MM-DD"); return; } x.deadline = v; await store.saveApp(x); toast("Deadline saved"); }
+  if (t.id === "resumeFile" && t.files[0]) { const f = t.files[0]; t.value = ""; uploadResume(f); return; }
   if (t.id === "importFile" && t.files[0]) {
     const m = $("#dataMsg");
     try { const data = JSON.parse(await t.files[0].text());

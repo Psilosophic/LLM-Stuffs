@@ -8,7 +8,7 @@ A phone-first version of the [ai-job-search](https://github.com/MadsLorentzen/ai
 
 | Tab | Matches ai-job-search | What happens |
 |---|---|---|
-| Find | `/scrape` + `/rank` | Searches Indeed, Dice and ZipRecruiter through your claude.ai connectors, then scores every result against your profile |
+| Find | `/scrape` + `/rank` | **Find jobs for me**: one tap searches every target role from your profile, in your location and/or remote, across Indeed, Dice and ZipRecruiter. It dedupes the results, marks jobs you haven't seen before, and has Claude rank them against your profile. A custom search is also available |
 | Apply | `/apply` | Eligibility, language and location gates, then the 5-dimension fit score (30/25/15/30 weights, same thresholds). After that: a drafter pass, a hiring-manager reviewer pass, and a final CV + cover letter. Download as Word or copy the text. Flags stretch claims so you can keep, soften or drop each one. Answers application-form questions within a character limit |
 | Tracker | `/outcome` | Same status vocabulary (`drafted`, `applied`, `interview`, `offer`, `hired`, `rejected`, `no_response`, `offer_declined`, `withdrawn`, plus `saved`). Shows deadline warnings and days quiet, logs follow-ups, and drafts follow-up emails |
 | Interview | `/interview` | Prep pack (STAR answers built only from your real experience, tough questions, questions to ask) and a practice interview |
@@ -31,3 +31,9 @@ A phone-first version of the [ai-job-search](https://github.com/MadsLorentzen/ai
 ## Updating
 
 Edit `index.html`, then republish it to the same artifact URL from a Claude Code session.
+
+## Sharing with someone else
+
+Each person needs their own Claude account (a paid plan is recommended, because drafting uses a lot of usage). They also need their own Indeed / Dice / ZipRecruiter connectors added in claude.ai Settings → Connectors.
+
+Share the artifact from its **Share** menu and invite them by email as an **Editor**. Each viewer's data lives in their own private `data/users/<id>/` subtree; nobody else can read it, the owner included. If they're invited at a level that can't write (Viewer or Commenter), the app saves on their device instead and tells them to ask for Editor access.

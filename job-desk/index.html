@@ -478,6 +478,7 @@ function mcpErr(e, server) {
     case "server_unavailable": return `${server} didn't answer. Try again in a minute.`;
     case "blocked_by_policy": case "approval_required": return `${server} is blocked by your organization's settings.`;
     case "board_busy": return `${server} is limiting how many requests your account can make right now, so ${server} was skipped this time. Try again in a few minutes.`;
+    case "board_down": return `${server} stopped answering, so the rest of the ${server} searches were skipped. Try again in a few minutes.`;
     case "tool_error": return `${server} reported an error: ${e.message || "unknown"}`;
     case "not_granted": case "capability_disabled": case "capability_removed": return `Job boards only work when this page is open inside Claude.`;
     default: return `${server} failed: ${(e && e.message) || "unknown error"}`;
@@ -497,14 +498,19 @@ async function inLane(server, fn) {
   } finally { L.active--; const next = L.wait.shift(); if (next) next(); }
 }
 const isRateLimit = e => e && (e.code === "rate_limited" || /rate limit|-32429|too many requests/i.test(String(e.message || "")));
+/* a connector that never answers would freeze the whole search, so every call gets a deadline; one miss benches that board for 2 minutes */
+const BOARD_TIMEOUT = { Jev: 120000 };
+function withDeadline(p, ms) { let t; return Promise.race([p, new Promise((_, rej) => { t = setTimeout(() => rej({ code: "board_down" }), ms); })]).finally(() => clearTimeout(t)); }
 async function callBoard(server, tool, input) {
   if (!cap.mcp) throw { code: "capability_disabled" };
   const o = tool === "get_resume" ? {} : { cache: { staleTime: 300000, gcTime: 3600000 } };
   for (let attempt = 0; ; attempt++) {
     const L0 = lanes[server];
+    if (L0 && L0.down && Date.now() - L0.down < 120000) throw { code: "board_down", server };
     if (L0 && L0.tripped && Date.now() - L0.tripped < 60000) throw { code: "board_busy", server };
-    try { return await inLane(server, async () => (await cap.mcp.callTool(server, tool, input, o)).payload); }
+    try { return await inLane(server, async () => (await withDeadline(cap.mcp.callTool(server, tool, input, o), BOARD_TIMEOUT[server] || 40000)).payload); }
     catch (e) {
+      if (e && e.code === "board_down") { const L = lanes[server]; if (L) L.down = Date.now(); throw { code: "board_down", server }; }
       if (isRateLimit(e) && attempt >= 1) { const L = lanes[server]; if (L) L.tripped = Date.now(); throw { code: "board_busy", server, message: e.message }; }
       if (isRateLimit(e) && attempt < 1) {
         const m = String(e.message || "").match(/in (\d+(?:\.\d+)?) ?s/i);
@@ -583,7 +589,7 @@ async function runQueries(calls, opts = {}) {
 
 /* Indeed search results carry no description, so ranking them was guesswork. Read the full postings first. */
 async function enrichResults() {
-  const tripped = lanes.Indeed && lanes.Indeed.tripped && Date.now() - lanes.Indeed.tripped < 60000;
+  const tripped = lanes.Indeed && ((lanes.Indeed.tripped && Date.now() - lanes.Indeed.tripped < 60000) || (lanes.Indeed.down && Date.now() - lanes.Indeed.down < 120000));
   const todo = tripped ? [] : S.results.filter(j => j.src === "Indeed" && j.id && !j.posting).slice(0, 24);
   if (!todo.length) return;
   S.busy.enrich = true; S.progress = { done: 0, total: todo.length, label: "Reading full job descriptions" }; renderResults();
@@ -710,7 +716,7 @@ function renderResults() {
   const pr = S.progress || { done: 0, total: 0 };
   const st = (S.busy.search ? working(`Searching ${esc(S.lastRunLabel || "")}… ${pr.done} of ${pr.total} searches done`) : S.busy.enrich ? working(`Reading full job descriptions… ${pr.done} of ${pr.total}`) : "")
     + `<div class="small muted">${Object.entries(S.srcStatus).filter(([, v]) => v.n).map(([s, v]) => `${esc(s)}: ${v.n}`).join(" · ")}</div>`
-    + Object.entries(S.srcStatus).filter(([, v]) => v.state !== "busy" && v.errs && v.errs.length).map(([s, v]) => `<div class="note ${v.ok ? "warn" : "bad"} small">${esc(v.ok ? `${s} slowed us down partway through, so some ${s} searches were skipped. The ${v.n} ${s} jobs above are fine.` : v.errs[0] || "")}</div>`).join("");
+    + Object.entries(S.srcStatus).filter(([, v]) => v.state !== "busy" && v.errs && v.errs.length).map(([s, v]) => `<div class="note ${v.ok ? "warn" : "bad"} small">${esc(v.ok ? `${s} had trouble partway through (${/stopped answering/.test(v.errs[0]) ? "stopped answering" : "rate limit"}), so some ${s} searches were skipped. The ${v.n} ${s} jobs above are fine.` : v.errs[0] || "")}</div>`).join("");
   if (!S.results.length) {
     box.innerHTML = st ? `<div class="card">${st}</div>` : (S.busy.search ? "" : `<div class="card"><span class="eyebrow">How this works</span>
       <p>Search Indeed, Dice and ZipRecruiter at once. Tap <b>Rank for me</b> to score every result against your profile, then <b>Check fit</b> on the ones worth a look.</p>

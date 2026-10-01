@@ -1,0 +1,8 @@
+{
+  "name": "jev-job-ranker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "MCP connector that scores job postings against a candidate profile with TypeSafe Jev",
+  "engines": { "node": ">=20" }
+}

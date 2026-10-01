@@ -500,15 +500,19 @@ async function inLane(server, fn) {
 const isRateLimit = e => e && (e.code === "rate_limited" || /rate limit|-32429|too many requests/i.test(String(e.message || "")));
 /* a connector that never answers would freeze the whole search, so every call gets a deadline; one miss benches that board for 2 minutes */
 const BOARD_TIMEOUT = { Jev: 120000 };
+/* a benched board stays benched for 5 minutes, long enough to cover a whole search, so it can't eat a retry cycle per query; calls already queued in the lane check again before they go */
+function benchCheck(server) {
+  const L = lanes[server]; if (!L) return;
+  if (L.down && Date.now() - L.down < 120000) throw { code: "board_down", server };
+  if (L.tripped && Date.now() - L.tripped < 300000) throw { code: "board_busy", server };
+}
 function withDeadline(p, ms) { let t; return Promise.race([p, new Promise((_, rej) => { t = setTimeout(() => rej({ code: "board_down" }), ms); })]).finally(() => clearTimeout(t)); }
 async function callBoard(server, tool, input) {
   if (!cap.mcp) throw { code: "capability_disabled" };
   const o = tool === "get_resume" ? {} : { cache: { staleTime: 300000, gcTime: 3600000 } };
   for (let attempt = 0; ; attempt++) {
-    const L0 = lanes[server];
-    if (L0 && L0.down && Date.now() - L0.down < 120000) throw { code: "board_down", server };
-    if (L0 && L0.tripped && Date.now() - L0.tripped < 60000) throw { code: "board_busy", server };
-    try { return await inLane(server, async () => (await withDeadline(cap.mcp.callTool(server, tool, input, o), BOARD_TIMEOUT[server] || 40000)).payload); }
+    benchCheck(server);
+    try { return await inLane(server, async () => { benchCheck(server); return (await withDeadline(cap.mcp.callTool(server, tool, input, o), BOARD_TIMEOUT[server] || 40000)).payload; }); }
     catch (e) {
       if (e && e.code === "board_down") { const L = lanes[server]; if (L) L.down = Date.now(); throw { code: "board_down", server }; }
       if (isRateLimit(e) && attempt >= 1) { const L = lanes[server]; if (L) L.tripped = Date.now(); throw { code: "board_busy", server, message: e.message }; }
@@ -571,7 +575,7 @@ async function runQueries(calls, opts = {}) {
       const st = S.srcStatus[server];
       try { const list = parse(await callBoard(server, tool, input)); S.results.push(...list); st.n += list.length; st.ok = true; }
       catch (e) { const m = mcpErr(e, server); if (!st.errs.includes(m)) st.errs.push(m); }
-      S.progress.done++; renderResults();
+      st.at = Math.round((Date.now() - t0) / 1000); S.progress.done++; renderResults();
     }
   };
   const t0 = Date.now();
@@ -589,7 +593,7 @@ async function runQueries(calls, opts = {}) {
 
 /* Indeed search results carry no description, so ranking them was guesswork. Read the full postings first. */
 async function enrichResults() {
-  const tripped = lanes.Indeed && ((lanes.Indeed.tripped && Date.now() - lanes.Indeed.tripped < 60000) || (lanes.Indeed.down && Date.now() - lanes.Indeed.down < 120000));
+  let tripped = false; try { benchCheck("Indeed"); } catch { tripped = true; }
   const todo = tripped ? [] : S.results.filter(j => j.src === "Indeed" && j.id && !j.posting).slice(0, 24);
   if (!todo.length) return;
   S.busy.enrich = true; S.progress = { done: 0, total: todo.length, label: "Reading full job descriptions" }; renderResults();
@@ -731,7 +735,7 @@ function renderResults() {
       <button class="btn sm primary" data-act="rank" ${S.busy.rank || S.busy.search || S.busy.enrich ? "disabled" : ""}>${S.results.some(j => j.fit != null) ? "Re-rank" : "Rank for me"}</button></div>
     ${st}
     ${S.busy.rank ? working("Scoring these against your profile…") : ""}
-    ${S.timing && !S.busy.search && !S.busy.enrich && !S.busy.rank ? `<div class="wc">Took: ${S.timing.n} searches ${S.timing.search}s${S.timing.read != null ? ` · ${S.timing.nRead} descriptions ${S.timing.read}s` : ""}${S.timing.rank != null ? ` · ranking ${S.timing.rank}s${S.rankedBy ? " (" + S.rankedBy + ")" : ""}` : ""}</div>` : ""}
+    ${S.timing && !S.busy.search && !S.busy.enrich && !S.busy.rank ? `<div class="wc">Took: ${S.timing.n} searches ${S.timing.search}s${S.srcStatus && Object.values(S.srcStatus).some(v => v.at != null) ? " (" + Object.entries(S.srcStatus).filter(([, v]) => v.at != null).map(([s, v]) => `${esc(s)} done ${v.at}s`).join(", ") + ")" : ""}${S.timing.read != null ? ` · ${S.timing.nRead} descriptions ${S.timing.read}s` : ""}${S.timing.rank != null ? ` · ranking ${S.timing.rank}s${S.rankedBy ? " (" + S.rankedBy + ")" : ""}` : ""}</div>` : ""}
     ${S.jevNote && S.rankedBy === "Claude" && !S.busy.rank ? `<div class="note warn small">${esc(S.jevNote)}</div>` : ""}
     ${S.rankNote ? `<div class="note bad small">${esc(S.rankNote)}</div>` : ""}
     ${newCount && newCount < S.results.length ? `<div class="seg" role="group" aria-label="Show"><button aria-pressed="${!S.newOnly}" data-act="newOnly" data-v="0">All</button><button aria-pressed="${S.newOnly}" data-act="newOnly" data-v="1">New only</button></div>` : ""}

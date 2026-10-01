@@ -978,18 +978,24 @@ async function keepAwake(on) {
   try { if (on && !wakeLock && navigator.wakeLock) { wakeLock = await navigator.wakeLock.request("screen"); } else if (!on && wakeLock) { await wakeLock.release(); wakeLock = null; } } catch { wakeLock = null; }
 }
 function batchCandidates(minScore) {
-  const tracked = new Set(S.apps.filter(a => a.ready || a.status !== "saved").map(jobKey));
+  // skip jobs already prepped, applied to, or already full-checked and turned down (no point re-checking them every run)
+  const tracked = new Set(S.apps.filter(a => a.ready || a.status !== "saved" || a.kitNote).map(jobKey));
   return S.results.filter(j => j.fit != null && j.fit >= minScore && j.flag === "" && j.src !== "ZipRecruiter" && !tracked.has(jobKey(j)));
 }
 async function runBatch(retryList) {
   const min = Number(($("#batchMin") || {}).value) || (S.batch && S.batch.min) || 70, max = Number(($("#batchMax") || {}).value) || 3;
-  const list = retryList || batchCandidates(min).slice(0, max);
+  // "Prep 3" means 3 ready kits: when the full check turns a job down, backfill from the next candidate (up to 3x as many tries)
+  const list = retryList || batchCandidates(min);
   if (!list.length) { toast("No jobs match that cutoff"); return; }
-  S.batch = { items: list.map(j => ({ title: j.title, company: j.company, state: "waiting", note: "", job: j })), stop: false, running: true, min };
+  const target = retryList ? list.length : max, cap = retryList ? list.length : Math.min(list.length, max * 3);
+  const mk = j => ({ title: j.title, company: j.company, state: "waiting", note: "", job: j });
+  S.batch = { items: list.slice(0, Math.min(target, cap)).map(mk), stop: false, running: true, min, target, short: "" };
   lsSet("batchPrefs", { min, max });
   renderBatch(); keepAwake(true);
-  for (let i = 0; i < list.length; i++) {
+  let ready = 0, i = 0;
+  for (; i < cap && ready < target; i++) {
     if (S.batch.stop) { S.batch.items.slice(i).forEach(it => it.state = "cancelled"); break; }
+    if (i >= S.batch.items.length) S.batch.items.push(mk(list[i]));
     const it = S.batch.items[i], j = list[i];
     it.state = "working"; it.note = "Getting the full description…"; renderBatch();
     try {
@@ -997,21 +1003,22 @@ async function runBatch(retryList) {
       a = a ? clean(strip(a)) : jobToApp(j);
       if ((a.posting || "").length < 200) { const d = await fetchDetails(a, j); a.posting = d.text; if (d.partial) throw { code: "partial", message: "Only a short summary was available. Open it and paste the full description." }; }
       const r = await runKit(a, t => { it.note = t; renderBatch(); }, { minScore: Math.min(min, 60) });
-      it.state = r; it.id = a.id; it.score = a.score;
+      it.state = r; it.id = a.id; it.score = a.score; if (r === "ready") ready++;
       it.note = r === "ready" ? `Full check: ${a.score}/100 (${a.verdict}). CV, cover letter and form answers ready.` : a.kitNote;
     } catch (e) {
       it.state = "error"; it.job = j;
       it.note = e && e.code === "partial" ? e.message : sampleErr(e);
       if (e && ["rate_limited", "not_granted", "session_expired", "sampling_disabled", "not_declared", "capability_disabled"].includes(e.code)) {
-        S.batch.items.slice(i + 1).forEach((x, k) => { x.state = "cancelled"; x.job = list[i + 1 + k]; x.note = "Not started, because of the problem above."; });
+        S.batch.items.slice(i + 1).forEach(x => { x.state = "cancelled"; x.note = "Not started, because of the problem above."; });
         S.batch.halted = sampleErr(e);
         renderBatch(); break;
       }
     }
     renderBatch();
   }
+  if (!retryList && !S.batch.halted && !S.batch.stop && ready < target) S.batch.short = `Got ${ready} of the ${target} you asked for after checking ${i} job${i === 1 ? "" : "s"}${i < list.length ? " (stopped there so it doesn't burn through your whole list)" : " (that's every job at this cutoff)"}. Lower the score cutoff or run Find jobs again for more.`;
   S.batch.running = false; keepAwake(false); renderBatch(); renderResults();
-  toast("Application kits done");
+  toast(`${ready} application kit${ready === 1 ? "" : "s"} ready`);
 }
 const BATCH_PILL = { waiting: ["plain", "Waiting"], working: ["info", "Working"], ready: ["good", "Ready"], skipped: ["plain", "Skipped"], stopped: ["bad", "Stopped"], error: ["bad", "Problem"], cancelled: ["plain", "Cancelled"] };
 function renderBatch() {
@@ -1024,6 +1031,7 @@ function renderBatch() {
     <div class="stack">${b.items.map(it => { const [c, l] = BATCH_PILL[it.state]; return `<div class="row" style="align-items:flex-start"><span class="pill ${c}">${l}</span><div class="grow"><div style="font-weight:700">${esc(it.title)}</div><div class="small muted">${esc(it.company)}${it.note ? " · " + esc(it.note) : ""}</div></div>${it.state === "ready" && it.id ? `<button class="btn sm primary" data-act="open" data-id="${esc(it.id)}">Open</button>` : ""}</div>
       ${(it.state === "skipped" || it.state === "stopped") && it.id && !b.running ? `<div class="row" style="padding-left:4px"><button class="btn sm" data-act="open" data-id="${esc(it.id)}">See the full fit check</button><button class="btn sm primary" data-act="prepAnyway" data-id="${esc(it.id)}">Prep it anyway</button></div>` : ""}`; }).join("")}</div>
     ${!b.running && b.halted ? `<div class="note bad small"><b>Stopped early:</b> ${esc(b.halted)}</div>` : ""}
+    ${!b.running && b.short ? `<div class="note warn small">${esc(b.short)}</div>` : ""}
     ${!b.running && b.items.some(it => (it.state === "error" || it.state === "cancelled") && it.job) ? `<button class="btn block" data-act="batchRetry">Retry the ${b.items.filter(it => (it.state === "error" || it.state === "cancelled") && it.job).length} that didn't finish</button>` : ""}
     ${!b.running && b.items.some(it => it.state === "skipped") ? `<p class="small muted">The quick ranking only sees a summary. The full check reads the whole posting and is stricter, so some jobs drop out. That's it saving you time, not an error.</p>` : ""}</div>`;
 }
